@@ -1,0 +1,628 @@
+---
+title: "NanoString NCounter analysis: FPI vs Normal, IFNAR KO vs WT"
+author: "Michael S Chimenti"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Introduction
+
+## Project Summary 
+
+**We ran the Nanostring Neuroinflammation panel on tissue from WT mice and IFNAR KO mice with TBI and control groups from both genotypes. All groups have 5 subjects. The experiment went well with samples passing the quality checks run by nSolver. We’ve used nSolver to generate normalized gene counts and would like to do DESeq analysis and pathway analysis. We’re interested in addressing first: what are the TBI induced gene changes and 2nd and more interesting to us: what are the effects of IFNAR KO on TBI-induced gene changes. Could you help us with this analysis and tell us how you would model this for DESeq analysis? I’ve attached the Excel sheet that has the gene counts arranged by group: 1. WT FPI 2. IFNAR KO FPI 3. WT Sham 4. IFNAR KO sham. Group assignments are indicated on the top row of the excel sheet. We can send any other info on this data.**
+
+## Methods 
+
+Nanostring NCounter data were obtained as “RCC” format files. These were imported into R with 'readRcc' function from the NanoStringQCPro package (Bioconductor; https://www.bioconductor.org/packages/release/bioc/html/NanoStringQCPro.html; Bourgon et. al.).  Here, we follow the NanoString RUV normalization procedure outlined in Love, et. al (ref), for quality control checks and iterative RUVg normalization (Risso, et. al.).  All samples passed QC checks and were included in the analysis.  After visualization of the normalized data with RLE and PCA plots, RUVg-normalized data (k=2) was chosen for downstream DEG analysis.  A DESeq2 'dds' object was created from the normalized data using ‘DESeqDataSetFromMatrix’ with design conditioned on a grouped factor (genotype and FPI).  Pathway and GO term enrichment was carried out using ‘ClusterProfiler’ (ref).  R code for the analysis is available on Github.    
+
+Nickles D, Sandmann T, Ziman R, Bourgon R (2021). NanoStringQCPro: Quality metrics and data processing methods for NanoString mRNA gene expression data. R package version 1.26.0.
+
+Bhattacharya A, Hamilton AM, Furberg H, et al. An approach for normalization and quality control for NanoString RNA expression data. Brief Bioinform. 2021;22(3):bbaa163. doi:10.1093/bib/bbaa163
+
+Risso D, Ngai J, Speed T, Dudoit S (2014). “Normalization of RNA-seq data using factor analysis of control genes or samples.” Nature Biotechnology, 32(9), 896–902. In press, http://www.nature.com/nbt/journal/v32/n9/full/nbt.2931.html.
+
+Love MI, Huber W, Anders S (2014). “Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2.” Genome Biology, 15, 550. doi: 10.1186/s13059-014-0550-8.
+
+#### Library imports 
+Click the "Code" button to see hidden code.  
+```{r, imports, warning=FALSE, message=FALSE}
+
+## Format and plotting 
+library(ggrepel)
+library(kableExtra)
+library(pcaExplorer)
+library(Vennerable)
+require(ggplot2)
+
+## Nanostring specific 
+library(RUVSeq)
+library(NanoStringQCPro)
+library(NanoNormIter)
+#library(NanoStringDiff)
+
+## DE analysis 
+library(DESeq2)
+library(limma)
+library(matrixStats)
+library(EnvStats)
+
+## TidyR
+library(tidyverse)
+library(magrittr)
+
+```
+
+#### Function definitions 
+
+```{r, function_defs}
+## Volcano Plot
+
+do_vol_plot <- function(df, sig=0.05, fc=0.5, size = 4){
+  
+  df_sig<- df %>% filter(padj < sig)
+  
+  ## genes with labels -- signficant,decreased expression and start with IGF
+  
+  df_label<- df %>% 
+              filter(padj < sig, abs(log2FoldChange) > fc)
+              #mutate(short_id = stringr::str_split(gene_id, "000000") %>% map_chr(.,2))
+  
+  
+  ## plot
+  
+  p <- ggplot(df, aes(log2FoldChange, -log10(padj)))  +
+      geom_point(size=0.8, color="black", alpha=.8) + 
+      geom_point(size=0.8, data=df_sig, aes(log2FoldChange, -log10(padj)), colour="red") +
+       geom_text_repel(size= size, 
+                    colour="black",
+                    segment.size=0.1, 
+                    nudge_x=0.06, 
+                    nudge_y=0.06, 
+                    data=df_label,
+                    aes(log2FoldChange, -log10(padj), label=gene_name), 
+                    max.iter= 200, 
+                    point.padding = 0.15, 
+                    segment.alpha = 1, 
+                    box.padding=.15,
+                    min.segment.length = unit(0.15, 'lines'),size=2.5) +
+    theme(
+      axis.text.x = element_text(size=12),
+      axis.text.y = element_text(size=12),
+      axis.title.x = element_text(size=14, margin = margin(t = 10, r = 0, b = 10, l = 0)),
+      axis.title.y = element_text(size=14, margin = margin(t = 0, r = 10, b = 0, l = 10)),
+      plot.margin =unit(c(.5,.5,.5,.5),"cm"),
+      plot.title = element_text(size = 11)
+    )
+  
+  return (p)
+}
+
+
+#### THESE FUNCTIONS ARE IMPORTED BY 'NANONORMITER' PACKAGE
+# FOR REFERENCE, HERE ARE THE QC CHECKS: 
+# imagingQC <- function(rcc){
+# 
+#     fovRatio = as.numeric(rcc$Lane_Attributes[3]) / as.numeric(rcc$Lane_Attributes[2])
+#     if (!(fovRatio > .75)) {return('Flag')}
+#     if (fovRatio > .75) {return('No flag')}
+# 
+# }
+# 
+# #### INPUT: rcc - input from rcc (use readRcc from NanoStringQCPro)
+# ####         low, high - the lower and upper limits for binding density
+# #### OUTPUT: flag for binding density
+# 
+# bindingDensityQC <- function(rcc,low,high){
+# 
+#     bd = as.numeric(rcc$Lane_Attributes[6])
+#     if(!(bd < high & bd > low)) {return('Flag')}
+#     if (bd < high & bd > low) {return('No flag')}
+# 
+# 
+# }
+# 
+# #### INPUT: rcc - input from rcc (use readRcc from NanoStringQCPro)
+# #### OUTPUT: flag for linearity for positive controls
+# 
+# positiveLinQC <- function(rcc){
+# 
+#     counts = rcc$Code_Summary
+#     posControls = as.numeric(counts$Count[grepl('POS_',counts$Name)])
+#     known = c(128,128/4,128/16,128/64,128/256,128/(256*4))
+#     r2 = summary(lm(sort(posControls)~sort(known)))$r.squared
+#     if(!(r2 > .95) | is.na(r2)) {return('Flag')}
+#     if(r2 > .95) {return('No flag')}
+# 
+# }
+# 
+# #### INPUT: rcc - input from rcc (use readRcc from NanoStringQCPro)
+# ####         numSD - number of standard deviations to calibrate the LOD
+# #### OUTPUT: flag for limit of detection
+# 
+# limitOfDetectionQC <- function(rcc,numSD = 0){
+#
+#     counts = rcc$Code_Summary
+#     posE = as.numeric(counts$Count[counts$Name == 'POS_E'])
+#     negControls = as.numeric(counts$Count[grepl('NEG',counts$Name)])
+#     if(!(posE > mean(negControls) + numSD*sd(negControls))) {return('Flag')}
+#     if (posE > mean(negControls) + numSD*sd(negControls)) {return('No flag')}
+# 
+# }
+##### HERE IS THE RUV CALCULATION AS IMPLEMENTED IN NANONORMITER()
+# RUV_total <- function(raw,pData,fData,k,hkgenes = NULL,exclude = NULL){
+# 
+#     library(RUVSeq)
+#     library(DESeq2)
+#     library(limma)
+#     library(matrixStats)
+# 
+#     if (!is.null(hkgenes)){
+# 
+#         fData(set)$Class[rownames(set) %in% hkgenes] = 'Housekeeping'
+# 
+#     }
+# 
+#     fData = fData[rownames(raw),]
+#     int = intersect(rownames(raw),rownames(fData))
+#     fData = fData[int,]
+#     raw = raw[int,]
+# 
+#     set <- newSeqExpressionSet(as.matrix(round(raw)),
+#                                phenoData=pData,
+#                                featureData=fData)
+# 
+#     cIdx <- rownames(set)[fData(set)$Class == "Housekeeping"]
+#     cIdx = cIdx[!(cIdx %in% exclude)]
+#     x <- as.factor(pData$Group)
+#     set <- betweenLaneNormalization(set, which="upper")
+#     set <- RUVg(set, cIdx, k=k)
+#     dds <- DESeqDataSetFromMatrix(counts(set),colData=pData(set),design=~1)
+#     rowData(dds) <- fData
+#     dds <- estimateSizeFactors(dds)
+#     dds <- estimateDispersionsGeneEst(dds)
+#     cts <- counts(dds, normalized=TRUE)
+#     disp <- pmax((rowVars(cts) - rowMeans(cts)),0)/rowMeans(cts)^2
+#     mcols(dds)$dispGeneEst <- disp
+#     dds <- estimateDispersionsFit(dds, fitType="mean")
+#     vsd <- varianceStabilizingTransformation(dds, blind=FALSE)
+#     mat <- assay(vsd)
+#     covars <- as.matrix(colData(dds)[,grep("W",colnames(colData(dds))),drop=FALSE])
+#     mat <- removeBatchEffect(mat, covariates=covars)
+#     assay(vsd) <- mat
+#     return(list(set = set,vsd = vsd))
+# 
+# }
+
+```
+
+#### nSolver data import 
+This is code for import of the normalized data. We will keep this but not use it. 
+
+```{r, import_excel, eval=FALSE}
+# 
+# dat <- readxl::read_xlsx("11-18-21 Normalized Data.xlsx", col_names = FALSE)
+# 
+# ## subset pdata and counts 
+# pdata <- dat[1:15,]
+# counts <- dat[31:800,]
+# 
+# ## clean up pheno data
+# pdata <- pdata[c(1,4,15),-c(1,2,8,14,20)]
+# pdata <- t(pdata) %>% as_tibble()
+# colnames(pdata) <- c("group","samplename","bind_dens")
+# pdata$group <- rep(c("wt_fpi","ko_fpi","wt_cont","ko_cont"), each=5, len=20)
+# pdata$samplename <- paste0("sample_", pdata$samplename)
+# pdata <- pdata %>% as.data.frame()
+# 
+# ## clean up counts data
+# counts <- counts[,-c(1,8,14,20)]
+# colnames(counts) <- c("gene", pdata$samplename)
+# genes <- counts$gene
+# counts <- counts %>% select(sample_1:sample_20) %>% mutate(across(, as.integer)) %>% as.data.frame() #convert to numerics https://dplyr.tidyverse.org/reference/across.html
+# rownames(counts) <- genes
+
+```
+
+# RUVSeq Analysis 
+
+RUV-seq method of Love et. al. for best-practices normalization and removal of unwanted technical artifacts
+
+Here, we will follow the method of Love, et. al. (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8138885/):  
+
+**"Using DESeq2 [25], we identified genes differentially expressed in NK cells primed by CTV-1 or IL-2 cytokines compared to unprimed NK cells at FDR-adjusted equation M22. The two normalization methods led to a different number of differentially expressed genes with a limited overlap of significant genes by both methods (Figure 4A). The raw equation M23-value histograms from differential expression analysis using nSolver-normalized expression exhibited a slope toward 0 for equation M24-values under 0.3, which can indicate issues with unaccounted-for correlations among samples [42], such as residual technical variation. The distributions of equation M25-values using the RUVSeq-normalized data were closer to uniform throughout the range [0,1] for most genes (Figure 4B). While the log2-fold changes were correlated between the two normalization procedures, the genes found to be differentially expressed only with nSolver-normalized data tended to have large standard errors with RUVSeq-normalized data and therefore not statistically significant using RUVSeq (Figure 4C). These differences in DE results emphasize the importance of properly validating normalization prior to downstream genomic analyses."**
+
+
+## Import RCC files 
+
+### Create pheno and expr tables
+```{r, import_data}
+files.RCC = list.files("./RCC", full.names = TRUE)
+#files.RCC = files.RCC[grepl('RCC',files.RCC)]
+ng = nrow(readRcc(files.RCC[1])$Code_Summary)
+ncol = length(files.RCC)
+
+raw_expression = as.data.frame(matrix(nrow = ng,ncol = length(files.RCC)+2))
+colnames(raw_expression)[1:2] = c('Gene','Class')
+pData = as.data.frame(matrix(nrow = length(files.RCC),ncol = 11))
+colnames(pData) = c('BCAC_ID','SampleID','Owner','Comments','Date','GeneRLF','SystemAPF','imagingQC',
+                    'bindingDensityQC','limitOfDetectionQC','positiveLinearityQC')
+raw_expression[,1:2] = readRcc(files.RCC[1])$Code_Summary[,c(2,1)]
+
+head(pData, 5)
+head(raw_expression, 5)
+```
+
+### Populate empty tabs from RCC
+
+```{r, create_pData, message=FALSE,warning=FALSE}
+for (i in 1:length(files.RCC)){
+  #i = 1 
+  print(i)
+  rcc = readRcc(files.RCC[i])
+  raw = rcc$Code_Summary
+  
+  raw_expression[,i+2] = as.numeric(raw$Count)
+  colnames(raw_expression)[i+2] = strsplit(files.RCC[i],'/')[[1]][3]
+  pData[i,2:7] = as.vector(rcc$Sample_Attributes)
+  pData$imagingQC[i] = imagingQC(rcc)
+  pData$bindingDensityQC[i] = bindingDensityQC(rcc,.05,2.25)
+  pData$limitOfDetectionQC[i] = limitOfDetectionQC(rcc)
+  pData$positiveLinearityQC[i] = positiveLinQC(rcc)
+}
+
+pData$SampleID <- paste0("sample_", pData$SampleID)
+pData$Group <- rep(c("IFNAR_control","IFNAR_FPI","WT_control","WT_FPI"), each=5)
+head(pData)
+```
+
+
+### Check QC flags
+```{r, checkQCflags}
+pData[,8:11]
+
+```
+
+For reference, the QC check functions can be found in the "function definitions" code block above.  
+
+**We see no QC flags are set on any of the samples**. 
+
+This hidden code block does more setup and preparation for analysis.  
+```{r, make_pData, warning=FALSE}
+raw = raw_expression[,-c(1:2)]
+fData = raw_expression[,c(1:2)]
+rownames(raw) = fData$Gene
+cIdx <- fData$Gene[fData$Class == "Housekeeping"]
+pData$HK_Gene_Miss = colSums(raw[cIdx,] == 0)
+rownames(fData) = fData$Gene
+rownames(raw) = fData$Gene
+rownames(pData) = colnames(raw)
+
+## making variance stabilized raw counts for later PCA plotting 
+dds_raw_counts <- DESeqDataSetFromMatrix(as.matrix(raw),colData=pData,design=~Group)
+vst_raw_counts <- DESeq2::varianceStabilizingTransformation(dds_raw_counts)
+```
+
+## Check Housekeeping Genes {.tabset}
+
+So let's proceed to checking whether housekeeping genes correlate with treatment: 
+```{r,housekeeping}
+#### CHECK IF housekeeping Genes ARE ASSOCIATED WITH PRIMARY PHENO
+hk_raw = raw[cIdx,]
+pval = vector(length = nrow(hk_raw))
+
+require(MASS)
+
+for (i in 1:nrow(hk_raw)){
+  
+  reg = glm.nb(as.numeric(hk_raw[i,]) ~ as.factor(pData$Group))
+  pval[i] = coef(summary(reg))[2,4]
+  
+}
+
+```
+
+### P-values
+
+These are the p-values of the relationship between the housekeeping genes and the treatment groups.  It appears that both "Gusb" and "Asb10" are DE with treatment.  
+
+```{r, pval_hk}
+pval <- pval %>% as_tibble() %>% mutate(hkgene = rownames(hk_raw))
+pval 
+
+```
+
+
+### Gusb counts  
+```{r, gusb}
+gusb <- hk_raw['Gusb',] %>% t() %>% as_tibble() %>% mutate(group = pData$Group)
+p1 <- ggplot(gusb, aes(x=group,y=Gusb)) + geom_boxplot() + geom_jitter(width = 0.1) + ggtitle("Gusb HouseKeeping Gene Expression")
+p1
+
+```
+
+
+### Asb10 counts 
+```{r, asb10}
+Asb10 <- hk_raw['Asb10',] %>% t() %>% as_tibble() %>% mutate(group = pData$Group)
+p2 <- ggplot(Asb10, aes(x=group,y=Asb10)) + geom_boxplot() + geom_jitter(width = 0.1) + ggtitle("Asb10 HouseKeeping Gene Expression")
+p2
+```
+
+## Apply RUVg normalization here
+
+Now, we remove correlated negative control genes and apply RUVg normalization: 
+```{r,RUV_normalization, results='hide', message=FALSE}
+
+## Removing "Asb10" and "Gusb" from the analysis as housekeeping genes
+drop <- rownames(raw) %in% c("Asb10","Gusb")
+raw2 <- raw[!drop,]
+
+fData2 <- fData[!fData$Gene %in% c("Asb10","Gusb"),]
+
+## k = 1,2, and 3 
+## k is the number of sources of technical confounding (i.e., suspected batches)
+norm.dat.k1 <- NanoNormIter::RUV_total(raw2,pData,fData,k = 1)
+norm.dat.k2 <- NanoNormIter::RUV_total(raw2,pData,fData,k = 2)
+norm.dat.k3 <- NanoNormIter::RUV_total(raw2,pData,fData,k = 3)
+                               
+```
+
+## RLE analysis {.tabset}
+
+Here, we visualize the raw and RUV normalized (k=1,2, or 3; k is the number of sources of suspected technical confounding) datasets using an RLE plot.  An RLE plot shows the boxplots of the log-ratios of the gene-level read counts of each sample to those of a reference sample (defined as the median across the samples). Ideally, the distributions should be centered around the zero line and as tight as possible. Clear deviations indicate the need for normalization and/or the presence of outlying samples.
+
+### Raw Data 
+
+These are the raw, non-normalized counts 
+```{r, vis_raw_RLE}
+
+## Raw data
+EDASeq::plotRLE(as.matrix(raw), cex.lab=0.5)
+```
+
+### RUVg (k=1)
+
+These are RUVSeq normalized with k=1. 
+```{r, vis_RUV_RLE_1}
+## K=1
+EDASeq::plotRLE(norm.dat.k1$set)
+
+```
+
+### RUVg (k=2)
+
+These are RUVSeq normalized with k=2. 
+```{r, vis_RUV_RLE_2}
+## K=2
+EDASeq::plotRLE(norm.dat.k2$set)
+```
+
+### RUVg (k=3)
+
+These are RUVSeq normalized with k=3. 
+```{r, vis_RUV_RLE_3}
+## K=3
+EDASeq::plotRLE(norm.dat.k3$set)
+```
+
+## PCA analysis {.tabset}
+
+Here were look at the PCA plots for the raw (non-normalized), and RUVg normalized data with k=1,2,or3
+
+### PCA raw 
+There is a large separation on FPI treatment.  This could represent a combination of biological effects and batch effects.  
+```{r, pca_plots}
+## Raw data
+pcaExplorer::pcaplot(vst_raw_counts, intgroup = "Group", ellipse = FALSE, text_labels = FALSE)
+
+
+
+
+```
+
+
+### PCA RUV (k=1)
+
+Removing one batch variable leaves an outlier sample.  
+```{r}
+## RUVg norm, k=1
+pcaExplorer::pcaplot(norm.dat.k1$vsd, intgroup = "Group", ellipse = FALSE, text_labels = FALSE)
+
+```
+
+### PCA RUV (k=2)
+
+Removing two batch effects (variables) creates a more reasonable looking PCA plot with no obvious outliers.  
+```{r}
+## RUVg norm, k=2
+pcaExplorer::pcaplot(norm.dat.k2$vsd, intgroup = "Group", ellipse = FALSE, text_labels = FALSE)
+
+```
+
+### PCA RUV (k=3)
+
+Removing 3 batch variables may be overkill.  We want to be careful not to overfit the data or remove biological effects.  
+```{r}
+## RUVg norm, k=3
+pcaExplorer::pcaplot(norm.dat.k3$vsd, intgroup = "Group", ellipse = FALSE, text_labels = FALSE)
+```
+
+
+
+## {-}
+
+**To my eye, RUVg normalized data with k=2 (2 sources of unwanted variation) looks the best.**  
+
+# DESeq2 analysis 
+
+Let's test the DE analysis on these data using RUV normalized data (k=2) 
+
+## Create DESeq2 object 
+ 
+```{r, DESeq2}
+dds <- DESeqDataSetFromMatrix(countData = counts(norm.dat.k2$set[1:757,]),
+                              colData = pData(norm.dat.k2$set),
+                              design = ~ W_1 + W_2 + Group)
+dds <- DESeq(dds)
+
+```
+
+## Check Genotypes
+
+It appears that by NanoString Counts there is no difference between KO and WT. However, if the knockout creates inactive alternate transcripts, that may not show up here.   
+
+```{r, check_KO}
+
+plotCounts(dds, gene = "Ifnar1", intgroup = "Group")
+plotCounts(dds, gene = "Ifnar2", intgroup = "Group")
+```
+
+## DEG results 
+
+### WT FPI vs WT Control {.tabset}
+```{r, res1}
+res_WT <- as.data.frame(results(dds,contrast = c('Group','WT_FPI','WT_control')))
+```
+
+
+#### DEG table 
+```{r, table1}
+## Table of top DE genes 
+res_WT %>% 
+  arrange(padj) %>% 
+  filter(padj < 0.001) %>% 
+  dplyr::select(c(padj, baseMean, log2FoldChange)) %>% 
+  mutate(across(c(1:3), ~round(.x, digits=3))) %>% 
+  kableExtra::kable()
+```
+
+#### DEG Counts Selected Genes
+```{r, counts1}
+## Count plots of individual top DE genes 
+plotCounts(dds, "Csf3r", intgroup = "Group")
+plotCounts(dds, "Mpeg1", intgroup = "Group")
+plotCounts(dds, "Brd3", intgroup = "Group")
+
+```
+
+#### Volcano Plot 
+```{r, volplot1}
+res_WT$gene_name <- rownames(res_WT)
+## Volcano plot 
+p1 <- do_vol_plot(res_WT, sig = 0.05, size = 3)
+p1 <- p1 + ggtitle("Volcano Plot: WT FPI vs WT Control")
+p1
+```
+
+### {-}
+
+### IFNAR KO FPI vs IFNAR KO CONTROL {.tabset}
+
+#### DEG table 
+```{r, table2}
+res_IFNAR <- as.data.frame(results(dds,contrast = c('Group','IFNAR_FPI','IFNAR_control')))
+res_IFNAR %>%
+  arrange(padj) %>% 
+  filter(padj < 0.001) %>% 
+  dplyr::select(c(padj, baseMean, log2FoldChange)) %>% 
+  mutate(across(c(1:3), ~round(.x, digits=3))) %>% 
+  kableExtra::kable()
+
+```
+
+#### DEG Counts Selected Genes
+```{r, counts2}
+## Count plots of individual top DE genes 
+plotCounts(dds, "Bcl2a1a", intgroup = "Group")
+plotCounts(dds, "Trem2", intgroup = "Group")
+plotCounts(dds, "Dock2", intgroup = "Group")
+
+```
+
+#### Volcano Plot 
+```{r, volplot2}
+res_IFNAR$gene_name <- rownames(res_IFNAR)
+## Volcano plot 
+p1 <- do_vol_plot(res_IFNAR, sig = 0.05, size = 3)
+p1 <- p1 + ggtitle("Volcano Plot: IFNAR FPI vs IFNAR Control")
+p1
+```
+
+### {-}
+
+### IFNAR KO Control vs WT Control {.tabset}
+
+#### DEG table 
+```{r, res3}
+res_IFvWT <- as.data.frame(results(dds,contrast = c('Group','IFNAR_control','WT_control')))
+res_IFvWT %>% 
+  arrange(padj) %>% 
+  filter(padj < 0.001) %>% 
+  dplyr::select(c(padj, baseMean, log2FoldChange)) %>% 
+  mutate(across(c(1:3), ~round(.x, digits=3))) %>% 
+  kableExtra::kable()
+```
+
+#### Volcano plot 
+```{r}
+## Count plots of individual top DE genes 
+res_IFvWT$gene_name <- rownames(res_IFvWT)
+## Volcano plot 
+p1 <- do_vol_plot(res_IFvWT, sig = 0.05, size = 3)
+p1 <- p1 + ggtitle("Volcano Plot: IFNAR Control vs WT Control")
+p1
+```
+
+There are ZERO DEGs between IFNAR and WT controls.  This could be good in the sense that we're seeing only the impact of FPI. The effect of the knockout is apparently too subtle to be detected in this panel.  
+
+### {-}
+
+### IFNAR KO FPI vs WT FPI {.tabset}
+
+Here, we will investigate the (differential) response to FPI in the KO and WT animals. If there are no DEGs between these two groups, it means that the response was very similar (see above). 
+
+#### DEG table 
+```{r, res4}
+res_IFFPI_vWTFPI <- as.data.frame(results(dds,contrast = c('Group','IFNAR_FPI','WT_FPI')))
+
+res_IFFPI_vWTFPI %>% 
+  arrange(padj) %>% 
+  filter(padj < 0.001) %>% 
+  dplyr::select(c(padj, baseMean, log2FoldChange)) %>% 
+  mutate(across(c(1:3), ~round(.x, digits=3))) %>% 
+  kableExtra::kable()
+
+
+
+```
+
+#### Volcano Plot 
+```{r}
+res_IFFPI_vWTFPI$gene_name <- rownames(res_IFFPI_vWTFPI)
+## Volcano plot 
+p1 <- do_vol_plot(res_IFFPI_vWTFPI, sig = 0.05, size = 3)
+p1 <- p1 + ggtitle("Volcano Plot: IFNAR FPI vs WT FPI")
+p1
+```
+
+### {-}
+
+# Session Info 
+
+For reference and reproducible research: 
+```{r, sesh_info}
+sessionInfo()
+```
+```
+
